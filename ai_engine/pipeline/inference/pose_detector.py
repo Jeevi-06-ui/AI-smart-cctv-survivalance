@@ -28,9 +28,9 @@ class YOLOPoseDetector:
             self.model = None
             print("[Pose Engine] WARNING: Running without YOLO.")
 
-    def detect_fall(self, keypoints, bbox) -> Tuple[bool, float]:
+    def detect_fall(self, keypoints_xy, keypoints_conf, bbox) -> Tuple[bool, float]:
         """
-        Determines if a person has fallen based on bounding box ratio and torso angle.
+        Determines if a person has fallen using scale-invariant joint geometry and visibility scores.
         Returns (is_fallen, confidence)
         """
         x1, y1, x2, y2 = bbox
@@ -40,47 +40,67 @@ class YOLOPoseDetector:
         if height == 0 or width == 0:
             return False, 0.0
 
-        ratio = width / float(height)
+        # Lying flat on the floor is extremely horizontal (width is much larger than height)
+        # We increase this fallback ratio to 1.6 to prevent any false positives when close to webcam.
+        aspect_ratio = width / float(height)
         
-        # Keypoint indices: 5=L_Shoulder, 6=R_Shoulder, 11=L_Hip, 12=R_Hip
-        # Ensure keypoints are valid (confidence/visibility)
         try:
-            # Flatten keypoints if they are in tensor format
-            kpts = keypoints.cpu().numpy() if hasattr(keypoints, 'cpu') else keypoints
-            
-            l_shoulder = kpts[5]
-            r_shoulder = kpts[6]
-            l_hip = kpts[11]
-            r_hip = kpts[12]
-            
-            # If coordinates are 0,0 they weren't detected
-            if np.all(l_shoulder == 0) or np.all(l_hip == 0):
-                # Fallback to bounding box ratio if skeleton is occluded
-                is_fallen = ratio > 1.2
-                return is_fallen, min(0.85, ratio / 2.0) if is_fallen else 0.0
+            if keypoints_xy is None or keypoints_conf is None:
+                is_fallen = aspect_ratio > 1.6
+                return is_fallen, 0.75 if is_fallen else 0.0
 
-            # Calculate torso center points
+            kpts_xy = keypoints_xy.cpu().numpy() if hasattr(keypoints_xy, 'cpu') else keypoints_xy
+            kpts_conf = keypoints_conf.cpu().numpy() if hasattr(keypoints_conf, 'cpu') else keypoints_conf
+            
+            l_shoulder = kpts_xy[5]
+            r_shoulder = kpts_xy[6]
+            l_hip = kpts_xy[11]
+            r_hip = kpts_xy[12]
+            
+            # Verify if shoulders and hips are visible in the frame with high confidence (>0.45)
+            shoulders_visible = kpts_conf[5] > 0.45 and kpts_conf[6] > 0.45
+            hips_visible = kpts_conf[11] > 0.45 and kpts_conf[12] > 0.45
+            
+            # If coordinates are 0,0 or the keypoints are occluded/not-visible (conf < 0.45)
+            if not (shoulders_visible and hips_visible) or np.all(l_shoulder == 0) or np.all(l_hip == 0):
+                # Fallback to aspect ratio (lying flat is usually > 1.6 ratio)
+                is_fallen = aspect_ratio > 1.6
+                return is_fallen, min(0.85, aspect_ratio / 2.0) if is_fallen else 0.0
+
+            # Calculate torso center coordinates
             shoulder_mid_x = (l_shoulder[0] + r_shoulder[0]) / 2.0
             shoulder_mid_y = (l_shoulder[1] + r_shoulder[1]) / 2.0
             hip_mid_x = (l_hip[0] + r_hip[0]) / 2.0
             hip_mid_y = (l_hip[1] + r_hip[1]) / 2.0
             
-            # Calculate angle of torso relative to vertical
+            # Calculate physical dimensions of the torso
+            dy_torso = abs(shoulder_mid_y - hip_mid_y)
+            dx_shoulders = abs(l_shoulder[0] - r_shoulder[0])
+            
+            # Ratio of Torso Height to Shoulder Width (scale-invariant)
+            # Standing person ratio is > 1.5 (long torso). Lying down ratio drops < 0.65
+            torso_ratio = dy_torso / max(1.0, dx_shoulders)
+            
+            # Calculate angle of torso relative to vertical (0 is vertical, 90 is horizontal)
             dx = hip_mid_x - shoulder_mid_x
             dy = hip_mid_y - shoulder_mid_y
-            
-            # Angle in degrees (0 is perfectly vertical, 90 is horizontal)
             angle = math.degrees(math.atan2(abs(dx), abs(dy)))
             
-            # Fall condition: Torso is highly angled (>60 deg) OR bbox is wider than tall
-            is_fallen = angle > 60 or ratio > 1.2
-            conf = min(0.99, (angle / 90.0) if angle > 60 else (ratio / 2.0))
+            # A person has fallen if they are lying flat (low torso ratio) AND angled (>65 degrees)
+            # OR if their aspect ratio is extremely horizontal (>1.6)
+            is_fallen = (torso_ratio < 0.65 and angle > 65) or aspect_ratio > 1.6
             
+            # Calculate dynamic confidence
+            if is_fallen:
+                conf = min(0.99, max(0.5, (angle / 90.0) * (1.0 - torso_ratio)))
+            else:
+                conf = 0.0
+                
             return is_fallen, conf
             
         except Exception as e:
-            # Fallback to pure bounding box logic if keypoint extraction fails
-            is_fallen = ratio > 1.2
+            # Fallback to pure bounding box aspect ratio
+            is_fallen = aspect_ratio > 1.6
             return is_fallen, 0.75 if is_fallen else 0.0
 
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[Dict[str, Any]], Dict[str, Any]]:
@@ -100,14 +120,15 @@ class YOLOPoseDetector:
             track_ids = results[0].boxes.id.int().cpu().tolist()
             confidences = results[0].boxes.conf.cpu().numpy()
             
-            # Extract keypoints if available
-            keypoints_data = results[0].keypoints.xy if results[0].keypoints is not None else [None]*len(boxes)
+            # Extract keypoint coordinates and confidences if available
+            keypoints_xy = results[0].keypoints.xy if results[0].keypoints is not None else [None]*len(boxes)
+            keypoints_conf = results[0].keypoints.conf if (results[0].keypoints is not None and hasattr(results[0].keypoints, 'conf')) else [None]*len(boxes)
             
-            for box, track_id, conf, kpts in zip(boxes, track_ids, confidences, keypoints_data):
+            for box, track_id, conf, kpts_xy, kpts_conf in zip(boxes, track_ids, confidences, keypoints_xy, keypoints_conf):
                 x1, y1, x2, y2 = map(int, box)
                 
                 # Check for fall
-                is_fallen, fall_conf = self.detect_fall(kpts, box)
+                is_fallen, fall_conf = self.detect_fall(kpts_xy, kpts_conf, box)
                 if is_fallen:
                     fall_events += 1
 
@@ -121,13 +142,13 @@ class YOLOPoseDetector:
                 }
                 detections.append(det_info)
                 
-                # Draw Box (Red if fallen, Cyan if standing)
+                # Draw Box (Red if fallen, Blue if standing)
                 box_color = (0, 0, 255) if is_fallen else (255, 240, 0)
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, 2)
                 
                 # Draw Skeleton
-                if kpts is not None:
-                    kpts_np = kpts.cpu().numpy() if hasattr(kpts, 'cpu') else kpts
+                if kpts_xy is not None:
+                    kpts_np = kpts_xy.cpu().numpy() if hasattr(kpts_xy, 'cpu') else kpts_xy
                     for pt in kpts_np:
                         px, py = int(pt[0]), int(pt[1])
                         if px > 0 and py > 0:

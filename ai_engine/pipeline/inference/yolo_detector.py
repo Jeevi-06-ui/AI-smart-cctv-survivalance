@@ -50,9 +50,9 @@ class YOLO11PersonDetector:
         if self.model is None:
             return annotated_frame, detections, {"error": "Model not loaded"}
 
-        # Run YOLO real-time tracking (classes for person, car, motorcycle, bus, truck, backpack, handbag, suitcase)
+        # Run YOLO real-time tracking (classes for car, motorcycle, bus, truck, backpack, handbag, suitcase, knife)
         # persist=True enables the built-in tracker (BoT-SORT/ByteTrack)
-        results = self.model.track(frame, persist=True, classes=[0, 2, 3, 5, 7, 24, 26, 28], conf=self.confidence_threshold, verbose=False)
+        results = self.model.track(frame, persist=True, classes=[2, 3, 5, 7, 24, 26, 28, 43], conf=self.confidence_threshold, verbose=False)
         
         # Extract results
         if results[0].boxes is not None and results[0].boxes.id is not None:

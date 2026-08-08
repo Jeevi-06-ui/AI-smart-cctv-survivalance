@@ -6,6 +6,7 @@ import requests
 import uuid
 from typing import Optional
 import threading
+
 try:
     from flask import Flask, Response
 except ImportError:
@@ -16,6 +17,7 @@ except ImportError:
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from pipeline.ingest.rtsp_reader import CameraStreamReader
 from pipeline.inference.pose_detector import YOLOPoseDetector
+from pipeline.inference.yolo_detector import YOLO11PersonDetector
 from pipeline.inference.intrusion_counter import IntrusionAndCounterEngine
 
 BACKEND_URL = "http://localhost:8000"
@@ -89,7 +91,9 @@ for i in range(retries):
                         "active_detectors": {
                             "pose": True,
                             "fall": True,
-                            "intrusion": True
+                            "intrusion": True,
+                            "weapon": True,
+                            "fire": True
                         }
                     }
                 )
@@ -113,6 +117,9 @@ else:
 # Initialize the YOLO Pose model
 detector = YOLOPoseDetector(model_path="yolov8n-pose.pt")
 
+# Initialize the YOLO Object model (detects knives, backpacks, suitcases)
+object_detector = YOLO11PersonDetector(model_path="yolov8n.pt")
+
 # Initialize the Intrusion Counter
 intrusion_engine = IntrusionAndCounterEngine()
 
@@ -122,13 +129,17 @@ last_alert_time = {}
 def send_dashboard_alert(threat_type: str, severity: str, confidence: float, bbox: list):
     """Sends a POST request to log the security alert in the backend database."""
     try:
+        # Convert numpy types to native Python types to avoid JSON serialization crash
+        native_confidence = float(confidence)
+        native_bbox = [int(x) for x in bbox]
+        
         payload = {
             "camera_id": camera_id,
             "threat_type": threat_type,
             "severity": severity,
-            "confidence": round(confidence, 2),
+            "confidence": round(native_confidence, 2),
             "snapshot_url": "https://images.unsplash.com/photo-1557597774-9d273605dfa9?q=80&w=300", # Placeholder mock snapshot
-            "bounding_boxes": {"bbox": bbox}
+            "bounding_boxes": {"bbox": native_bbox}
         }
         res = requests.post(f"{BACKEND_URL}/api/v1/alerts", json=payload)
         if res.status_code == 200:
@@ -139,25 +150,27 @@ def send_dashboard_alert(threat_type: str, severity: str, confidence: float, bbo
         print(f"[API ERROR] Connection failure while pushing alert: {e}")
 
 def frame_callback(camera_id, frame, current_fps, latency_ms):
+    global latest_frame
     height, width = frame.shape[:2]
     fence_line = ((50, int(height / 2)), (width - 50, int(height / 2)))
-    
-    # Process Pose & Falls
-    annotated_frame, detections, summary = detector.process_frame(frame)
-    
     current_time = time.time()
     
-    # Process detections for fall alerts and line crossings
-    for det in detections:
+    # 1. Run Pose & Fall Detection
+    pose_frame, detections_pose, summary_pose = detector.process_frame(frame)
+    
+    # 2. Run General Object Detection (Knife, Bags, Vehicles)
+    final_frame, detections_obj, summary_obj = object_detector.process_frame(pose_frame)
+    
+    # 3. Process Fall Alerts and Line Crossings (using Pose tracking)
+    for det in detections_pose:
         track_id = det["track_id"]
         bbox = det["bbox"]
         
-        # 1. Fall Alerts
+        # A. Fall Alerts
         if det.get("is_fallen"):
-            # Limit alerts to once every 10 seconds per person ID to prevent spamming the database
             alert_key = f"fall_{track_id}"
             if current_time - last_alert_time.get(alert_key, 0) > 10:
-                print(f"[PERIMETER ALERT] Fall detected for ID {track_id}")
+                print(f"[SECURITY ALERT] Fall detected for ID {track_id}")
                 send_dashboard_alert(
                     threat_type="FALL_DETECTION",
                     severity="CRITICAL",
@@ -166,8 +179,7 @@ def frame_callback(camera_id, frame, current_fps, latency_ms):
                 )
                 last_alert_time[alert_key] = current_time
                 
-        # 2. Line Crossing / Intrusion Alerts
-        # Calculate centroid (middle of bbox for simple intrusion counter)
+        # B. Line Crossing / Intrusion Alerts (Feet centroid)
         centroid = (int((bbox[0] + bbox[2]) / 2), bbox[3])
         event = intrusion_engine.check_line_crossing(
             track_id=track_id,
@@ -178,7 +190,7 @@ def frame_callback(camera_id, frame, current_fps, latency_ms):
         if event:
             alert_key = f"intrusion_{track_id}_{event}"
             if current_time - last_alert_time.get(alert_key, 0) > 10:
-                print(f"[PERIMETER ALERT] Perimeter crossed ({event}) by ID {track_id}")
+                print(f"[SECURITY ALERT] Perimeter crossed ({event}) by ID {track_id}")
                 send_dashboard_alert(
                     threat_type="INTRUSION_DETECTION",
                     severity="HIGH",
@@ -187,40 +199,30 @@ def frame_callback(camera_id, frame, current_fps, latency_ms):
                 )
                 last_alert_time[alert_key] = current_time
 
-    # Draw the virtual fence line on top
-    final_frame = intrusion_engine.draw_roi_and_lines(
-        frame=annotated_frame, 
-        polygon_zone=[],
-        virtual_fence_line=fence_line
-    )
-    
-    # Save frame for background Flask streamer
-    global latest_frame
-    with frame_lock:
-        latest_frame = final_frame.copy()
-
-    # Display the live window
-    cv2.imshow("GuardianAI - Live Dashboard Pipeline", final_frame)
-    
-    # Check for 'q' key to quit
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        print("\n[Pipeline] Shutting down...")
-        reader.stop()
-        cv2.destroyAllWindows()
-        sys.exit(0)
-
-# Connect to default camera source (webcam index 0)
-camera_source = 0 
-print(f"Starting camera source {camera_source}...")
-reader = CameraStreamReader(camera_id="test-cam-1", stream_url=camera_source, target_fps=30)
-reader.start(callback=frame_callback)
-
-try:
-    while reader.running:
-        time.sleep(1)
-except KeyboardInterrupt:
-    reader.stop()
-    cv2.destroyAllWindows()
+    # 4. Process General Objects (Knife, Crowd Count)
+    person_count = len(detections_pose)
+    for det in detections_obj:
+        label = det["label"]
+        bbox = det["bbox"]
+            
+        # A. Weapon Detection (Knife)
+        if label == "knife":
+            alert_key = f"weapon_{det['track_id']}"
+            if current_time - last_alert_time.get(alert_key, 0) > 10:
+                print(f"[SECURITY ALERT] WEAPON DETECTED: KNIFE (ID {det['track_id']})")
+                send_dashboard_alert(
+                    threat_type="WEAPON_DETECTION",
+                    severity="CRITICAL",
+                    confidence=det["confidence"],
+                    bbox=bbox
+                )
+                last_alert_time[alert_key] = current_time
+                
+            # Draw Flashing red box around the weapon
+            cv2.rectangle(final_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 0, 255), 3)
+            cv2.putText(final_frame, "WEAPON THREAT", (bbox[0], bbox[1] - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+            
     # B. Crowd Congestion Warning (> 3 people)
     if person_count > 3:
         alert_key = "crowd_congestion"
@@ -263,8 +265,7 @@ except KeyboardInterrupt:
         virtual_fence_line=fence_line
     )
     
-    # Save frame for background Flask streamer
-    global latest_frame
+    # Save frame for background Flask streamer thread-safely
     with frame_lock:
         latest_frame = final_frame.copy()
 
