@@ -41,7 +41,13 @@ class CameraStreamReader:
         else:
             url = self.stream_url
             
-        self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+        if isinstance(url, int):
+            # Local USB camera, do not force FFMPEG
+            self.cap = cv2.VideoCapture(url)
+        else:
+            # RTSP/HTTP Stream
+            self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            
         # Minimize buffer size for real-time sub-100ms streaming
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         if self.cap.isOpened():
